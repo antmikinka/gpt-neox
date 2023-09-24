@@ -383,13 +383,108 @@ class ParallelSelfAttention(nn.Module):
             parallel_output=parallel_output,
             bias=neox_args.use_bias_in_attn_linear,
         )
-
+    from opt_einsum import contract
+    
     def attention(
-        self, query_layer, key_layer, value_layer, layer_past, attention_mask
+        self, query_layer, t_layer, query_rot, value_layer, layer_past, attention_mask
+        #self, query_layer, key_layer, value_layer, layer_past, attention_mask
     ):
         # ===================================
         # Raw attention scores. [b, np, s, s]
         # ===================================
+        #
+        # change from baddm to opt_einsum
+        # notice to pip install opt-einsum
+        attention_scores = \
+            contract('nbpd,sbpd,nbpd->bpns',
+                     query_layer, #[sq,b,np,hn]
+                     t_layer, # [sk,b,np,hn]
+                     query_rot, # [sq,b,np,hn]
+                     backend='torch'
+                    ) / self.norm_factor
+        # ==================================================
+        # Update attention mask for inference. [b, np, sq, sk]
+        # ==================================================
+        if self.use_cache:
+            with torch.no_grad():
+                attention_mask = attention_mask[
+                    ..., : attention_scores.size(3),
+                    : attention_scores.size(3)
+                ]
+
+        # ===========================
+        # Attention probs and dropout
+        # ===========================
+        if exists(self.rpe):
+            rpe = self.rpe(query_layer.size(0), t_layer.size(0))
+            attention_scores += rpe # [1, np, sq, sk]
+            
+        if self.pos_emb == "alibi":
+            attention_scores = self.alibi_embed(attention_scores)
+            
+        # attention scores and attention mask [b, np, sq, sk]
+        attention_probs = \
+            self.scale_mask_softmax(attention_scores,
+                                    attention_mask)
+        # This is actually dropping out entire tokens to attend
+        # to, which might seem a bit unusual, but is taken from
+        # the original Transformer paper.
+
+        with mpu.get_cuda_rng_tracker().fork():
+            attention_probs = \
+                    self.attention_dropout(attention_probs)
+
+        # =========================
+        # Context layer. [sq, b, hp]
+        # =========================
+        # value_layer -> context layer.
+        # [sk, b, np, hn] --> [b, np, sq, hn]
+        # context layer shape: [b, np, sq, hn]
+        output_size = (
+            value_layer.size(1),
+            value_layer.size(2),
+            query_layer.size(0),
+            value_layer.size(3),
+        )
+
+        # change view [sk, b * np, hn]
+        value_layer = value_layer.view(
+            value_layer.size(0),
+            output_size[0] * output_size[1], -1
+        )
+
+        # change view [b * np, sq, sk]
+        attention_probs = attention_probs.view(
+            output_size[0] * output_size[1], output_size[2], -1
+        )
+
+        # matmul: [b * np, sq, hn]
+        context_layer = torch.bmm(attention_probs,
+                                value_layer.transpose(0, 1))
+
+        # change view [b, np, sq, hn]
+        context_layer = context_layer.view(*output_size)
+        return context_layer
+
+
+        # below is old code, replaced by https://arxiv.org/pdf/2309.08646.pdf
+        # CURE THE HEADACHE OF TRANSFORMERS VIA COLLINEAR CONSTRAINED ATTENTION
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        '''
 
         # [b, np, sq, sk]
         output_size = (
@@ -486,6 +581,8 @@ class ParallelSelfAttention(nn.Module):
         # change view [b, np, sq, hn]
         context_layer = context_layer.view(*output_size)
         return context_layer
+        '''
+
 
     def flash_attention(self, query_layer, key_layer, value_layer):
         # [b, np, sq, sk]
@@ -612,6 +709,129 @@ class ParallelSelfAttention(nn.Module):
             query_layer, key_layer, value_layer, attn_mask=attn_mask, rpe=rpe
         )
 
+    def forward(self, hidden_states, attention_mask,
+                layer_past=None
+    ):
+    # hidden_states: [sq, b, h]
+        
+    # =====================
+    # Query, Key, and Value
+    # =====================
+        
+    # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
+    mixed_x_layer, _ = self.query_key_value(hidden_states)
+        
+    # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
+    new_tensor_shape = mixed_x_layer.size()[:-1] + (
+        self.num_attention_heads_per_partition,
+        3 * self.hidden_size_per_attention_head,
+    )
+
+    mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
+        
+    # replace key_layer with t_layer
+    (query_layer, t_layer, value_layer) = \
+        mpu.split_tensor_along_last_dim(mixed_x_layer, 3)
+        
+    t_layer_1 = t_layer[..., : t_layer.shape[-1] // 2]
+    t_layer_2 = t_layer[..., t_layer.shape[-1] // 2 :]
+    t_layer = (t_layer_1+t_layer_2)/2
+        
+    t_layer = F.relu(t_layer)
+        
+    t_layer = torch.cat((t_layer, t_layer), dim=-1)
+        
+    if exists(self.rotary_emb):
+        if exists(self.rotary_ndims):
+            # partial rotary
+            query_rot, query_pass = (
+                query_layer[..., : self.rotary_ndims],
+                query_layer[..., self.rotary_ndims :],
+            )
+            t_rot, t_pass = (
+                t_layer[..., : self.rotary_ndims],
+                t_layer[..., self.rotary_ndims :],
+            )
+            else:
+                # full rotary
+                query_rot, t_rot = query_layer, t_layer
+                
+            apply_rotary_fn = (
+                apply_rotary_pos_emb_torch if self.bf16 \
+                    else apply_rotary_pos_emb
+            )
+        
+            seq_len = query_layer.shape[0]
+            offset = 0
+            if exists(layer_past) and layer_past.numel() > 0:
+                offset = layer_past[0].shape[0]
+                seq_len += offset
+            cos, sin = self.rotary_emb(value_layer, seq_len=seq_len)
+        
+            query_rot, t_layer = apply_rotary_fn(
+                query_rot, t_rot, cos, sin, offset=offset
+            )
+        
+            if exists(self.rotary_ndims):
+                query_rot = torch.cat((query_rot, query_pass), dim=-1)
+                
+                t_layer = torch.cat((t_layer, t_pass), dim=-1)
+                
+    # ==================================
+    # Cache key and value for inference
+    # ==================================
+
+    if exists(layer_past) and layer_past.numel() > 0:
+        past_t, past_value = layer_past
+        t_layer = \
+            torch.cat((past_t.type_as(t_layer), t_layer), dim=0)
+        value_layer = torch.cat(
+            (past_value.type_as(value_layer), value_layer),
+            dim=0
+        )
+
+    if self.use_cache:
+        present = torch.stack((t_layer, value_layer))
+        
+    if self.use_flash_attention:
+        context_layer = \
+            self.flash_attention(query_layer, t_layer, value_layer)
+        
+    elif not self.sparse:
+        context_layer = self.attention(
+            query_layer, t_layer, query_rot, value_layer,
+            layer_past, attention_mask
+    )
+        
+    else:
+        context_layer = self.sparse_attention(
+            query_layer, t_layer, value_layer, attention_mask
+        )
+        
+    # [b, np, sq, hn] --> [sq, b, np, hn]
+    context_layer = \
+        context_layer.permute(2, 0, 1, 3).contiguous()
+
+    # [sq, b, np, hn] --> [sq, b, hp]
+    new_context_layer_shape = context_layer.size()[:-2] + (
+        self.hidden_size_per_partition,
+    )
+
+    context_layer = \
+        context_layer.view(*new_context_layer_shape)
+
+    # =================
+    # Output. [sq, b, h]
+    # =================
+
+    output, bias = self.dense(context_layer)
+
+    if self.use_cache:
+        output = [output, present]
+        
+    return output, bias
+
+    '''
     def forward(self, hidden_states, attention_mask, layer_past=None):
 
         # hidden_states: [sq, b, h]
@@ -712,7 +932,7 @@ class ParallelSelfAttention(nn.Module):
             output = [output, present]
 
         return output, bias
-
+        '''
 
 class ParallelTransformerLayer(nn.Module):
     """A single transformer layer.
